@@ -224,6 +224,13 @@ void logValue(Ptr<OutputStreamWrapper> stream, std::string context,
                          << newval << std::endl;
 }
 
+// void logQueue(Ptr<OutputStreamWrapper> stream, uint32_t oldval, uint32_t newval)
+// {
+//     auto current_time = Simulator::Now();
+//     *stream->GetStream() << ',' << current_time.GetSeconds() << ','
+//                          << newval << std::endl;
+// }
+
 void logDrop(Ptr<OutputStreamWrapper> stream,
              std::string context, Ptr<Packet const> p)
 {
@@ -278,6 +285,19 @@ NetDeviceContainer GetNetDevices(Ptr<Node> node)
     return devices;
 }
 
+// static void DecreaseLinkRate(CsmaHelper *channel)
+// {
+//     channel->SetChannelAttribute("DataRate", DataRateValue(DataRate("1Mbps")));
+// }
+
+// void DevPacketsInQueue(Ptr<OutputStreamWrapper> stream, std::string context, 
+//                         u_int32_t oldValue, u_int32_t newValue)
+// {
+//     auto current_time = Simulator::Now();
+//     *stream->GetStream() << context << ',' << current_time.GetSeconds() << ','
+//                          << newValue << std::endl;
+// }
+
 int main(int argc, char *argv[])
 {   
     // Measure wall clock time 
@@ -319,6 +339,9 @@ int main(int argc, char *argv[])
 
     auto choose_topo = 1;
     std::string cc_alg = "";
+    auto useL4s = false;
+    auto ceThreshold = 1;
+    auto useECT0 = false;
 
     CommandLine cmd;
     cmd.AddValue("topo", "Choose the topology", choose_topo);
@@ -335,6 +358,9 @@ int main(int argc, char *argv[])
     cmd.AddValue("prefix", "Prefix for log files.", prefix);
     cmd.AddValue("seed", "Set simulation seed", seed);
     cmd.AddValue("cc", "TCP-CC algorithm.", cc_alg);
+    cmd.AddValue("useL4s", "Use L4S ECN marking.", useL4s);
+    cmd.AddValue("ceThreshold", "CE threshold for CoDel.", ceThreshold);
+    cmd.AddValue("useECT0", "Use ECT0 marking.", useECT0);
     cmd.Parse(argc, argv);
 
     // Compute resulting workload datarates.
@@ -380,8 +406,12 @@ int main(int argc, char *argv[])
     Config::SetDefault("ns3::TcpSocket::SndBufSize", UintegerValue(4000000));
     Config::SetDefault("ns3::TcpSocket::RcvBufSize", UintegerValue(4000000));
     Config::SetDefault("ns3::TcpSocket::SegmentSize", UintegerValue(1380));
-    Config::SetDefault("ns3::TcpL4Protocol::SocketType", StringValue(cc_alg));
-    
+    // Config::SetDefault("ns3::TcpL4Protocol::SocketType", StringValue(cc_alg));
+    Config::SetDefault("ns3::TcpSocketBase::UseEcn", StringValue("On"));
+    Config::SetDefault("ns3::TcpDctcp::UseEct0", BooleanValue(useECT0));
+    Config::SetDefault("ns3::FqCoDelQueueDisc::CeThreshold", TimeValue(MilliSeconds(ceThreshold)));
+    Config::SetDefault("ns3::FqCoDelQueueDisc::UseL4s", BooleanValue(useL4s));
+
     //
     // Explicitly create the nodes required by the topology (shown above).
     //
@@ -451,14 +481,17 @@ int main(int argc, char *argv[])
     BridgeHelper bridge;
     bridge.Install(switchA, GetNetDevices(switchA));
     bridge.Install(switchB, GetNetDevices(switchB));
+
+    // PointToPointHelper p2p;
+    // p2p.SetQueue("ns3::DropTailQueue", "MaxSize", StringValue("50p"));
+    // NetDeviceContainer devices = p2p.Install(switches);
     
     // Add internet stack and IP addresses to the hosts
     NS_LOG_INFO("Setup stack and assign IP Addresses.");
     NetDeviceContainer hostDevices;
     // hostDevices.Add(GetNetDevices(sender));
     hostDevices.Add(GetNetDevices(receiver1));
-    hostDevices.Add(GetNetDevices(disturbance1));
-    
+    hostDevices.Add(GetNetDevices(disturbance1));    
 
     for (auto it = senders.Begin(); it != senders.End(); it++)
     {
@@ -469,6 +502,12 @@ int main(int argc, char *argv[])
     InternetStackHelper internet;
     internet.Install(hosts);
     internet.Install(senders);
+    // internet.Install(switches);
+
+    // TrafficControlHelper tch;
+    // // tch.SetRootQueueDisc ("ns3::PfifoFastQueueDisc", "MaxSize", StringValue ("1000p"));
+    // tch.SetRootQueueDisc("ns3::FqCoDelQueueDisc", "Flows", UintegerValue(2), "MaxSize", StringValue("50p"));
+    // tch.Install(devices);
 
     Ipv4AddressHelper ipv4;
     ipv4.SetBase("10.1.1.0", "255.255.255.0");
@@ -492,6 +531,11 @@ int main(int argc, char *argv[])
     auto trafficStart1 =  TimeStream(1, 1 + start_window);
     auto trafficStartInt1 = TimeStreamInt(1, 1 + start_window);
 
+    TypeIdValue TCPCubic;
+    TCPCubic = TypeId::LookupByName("ns3::TcpCubic");
+    TypeIdValue TCPDCTCP;
+    TCPDCTCP = TypeId::LookupByName("ns3::TcpDctcp");
+
     for (auto i_app = 0; i_app < n_apps; ++i_app)
     {
         // We also need to set the appropriate tag at every application!
@@ -505,6 +549,9 @@ int main(int argc, char *argv[])
             "Local", recvAddr1, "Protocol", TCP,
             "StartTime", simStart, "StopTime", simStop);
         receiver1->AddApplication(sink);
+        Ptr<TcpL4Protocol> recProto;
+        recProto = receiver1->GetObject<TcpL4Protocol>();
+        recProto->SetAttribute("SocketType", TypeIdValue(TCPDCTCP));
 
         // Sources for each workload
         // App indexing scheme: 0--n_apps-1: w1, n_apps -- 2n_apps-1: w2, etc.
@@ -524,6 +571,9 @@ int main(int argc, char *argv[])
             source1->TraceConnectWithoutContext(
                 "Tx", MakeBoundCallback(&setIdTag, 1, _id));
             senders.Get(_id)->AddApplication(source1);
+            Ptr<TcpL4Protocol> proto;
+            proto = senders.Get(_id)->GetObject<TcpL4Protocol>();
+            proto->SetAttribute("SocketType", TypeIdValue(TCPCubic));
         }
         if (rate_w2 > 0)
         {
@@ -540,6 +590,9 @@ int main(int argc, char *argv[])
             source2->TraceConnectWithoutContext(
                 "Tx", MakeBoundCallback(&setIdTag, 2, _id));
             senders.Get(_id)->AddApplication(source2);
+            Ptr<TcpL4Protocol> proto;
+            proto = senders.Get(_id)->GetObject<TcpL4Protocol>();
+            proto->SetAttribute("SocketType", TypeIdValue(TCPDCTCP));
         }
         if (rate_w3 > 0)
         {
@@ -556,6 +609,9 @@ int main(int argc, char *argv[])
             source3->TraceConnectWithoutContext(
                 "Tx", MakeBoundCallback(&setIdTag, 3, _id));
             senders.Get(_id)->AddApplication(source3);
+            Ptr<TcpL4Protocol> proto;
+            proto = senders.Get(_id)->GetObject<TcpL4Protocol>();
+            proto->SetAttribute("SocketType", TypeIdValue(TCPCubic));
         }
     }
 
@@ -660,9 +716,20 @@ int main(int argc, char *argv[])
         "/NodeList/*/DeviceList/*/$ns3::CsmaNetDevice/MacTxDrop",
         MakeBoundCallback(&logDrop, dropfile));
 
+    // std::stringstream rootqdiscfilename;
+    // rootqdiscfilename << prefix << "_rootqdisc.csv";
 
-    Ipv4GlobalRoutingHelper::PopulateRoutingTables();
+    // auto rootqdiscfile = asciiTraceHelper.CreateFileStream(rootqdiscfilename.str());
+    // // Ptr<NetDevice> switch1 = devices.Get(0);
+    // // Ptr<PointToPointNetDevice> ptpnd = DynamicCast<PointToPointNetDevice>(switch1);
+    // // Ptr<Queue<Packet>> queue = ptpnd->GetQueue();
+
+    // Config::Connect(
+    //     "/NodeList/*/$ns3::TrafficControlLayer/RootQueueDiscList/*/PacketsInQueue",
+    //     MakeBoundCallback(&DevPacketsInQueue, rootqdiscfile));
     
+    Ipv4GlobalRoutingHelper::PopulateRoutingTables();
+
     //
     // Now, do the actual simulation.
     //
